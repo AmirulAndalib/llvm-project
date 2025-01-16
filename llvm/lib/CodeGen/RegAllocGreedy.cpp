@@ -14,24 +14,21 @@
 #include "RegAllocGreedy.h"
 #include "AllocationOrder.h"
 #include "InterferenceCache.h"
-#include "LiveDebugVariables.h"
 #include "RegAllocBase.h"
 #include "RegAllocEvictionAdvisor.h"
 #include "RegAllocPriorityAdvisor.h"
-#include "SpillPlacement.h"
 #include "SplitKit.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/IndexedMap.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/CodeGen/CalcSpillWeights.h"
 #include "llvm/CodeGen/EdgeBundles.h"
+#include "llvm/CodeGen/LiveDebugVariables.h"
 #include "llvm/CodeGen/LiveInterval.h"
 #include "llvm/CodeGen/LiveIntervalUnion.h"
 #include "llvm/CodeGen/LiveIntervals.h"
@@ -52,6 +49,7 @@
 #include "llvm/CodeGen/RegAllocRegistry.h"
 #include "llvm/CodeGen/RegisterClassInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
+#include "llvm/CodeGen/SpillPlacement.h"
 #include "llvm/CodeGen/Spiller.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
@@ -60,8 +58,6 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/LLVMContext.h"
-#include "llvm/InitializePasses.h"
-#include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/BlockFrequency.h"
 #include "llvm/Support/BranchProbability.h"
@@ -144,7 +140,7 @@ static cl::opt<bool> GreedyReverseLocalAssignment(
 static cl::opt<unsigned> SplitThresholdForRegWithHint(
     "split-threshold-for-reg-with-hint",
     cl::desc("The threshold for splitting a virtual register with a hint, in "
-             "percentate"),
+             "percentage"),
     cl::init(75), cl::Hidden);
 
 static RegisterRegAlloc greedyRegAlloc("greedy", "greedy register allocator",
@@ -155,18 +151,18 @@ char &llvm::RAGreedyID = RAGreedy::ID;
 
 INITIALIZE_PASS_BEGIN(RAGreedy, "greedy",
                 "Greedy Register Allocator", false, false)
-INITIALIZE_PASS_DEPENDENCY(LiveDebugVariables)
-INITIALIZE_PASS_DEPENDENCY(SlotIndexes)
-INITIALIZE_PASS_DEPENDENCY(LiveIntervals)
+INITIALIZE_PASS_DEPENDENCY(LiveDebugVariablesWrapperLegacy)
+INITIALIZE_PASS_DEPENDENCY(SlotIndexesWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(RegisterCoalescer)
 INITIALIZE_PASS_DEPENDENCY(MachineScheduler)
-INITIALIZE_PASS_DEPENDENCY(LiveStacks)
-INITIALIZE_PASS_DEPENDENCY(MachineDominatorTree)
-INITIALIZE_PASS_DEPENDENCY(MachineLoopInfo)
-INITIALIZE_PASS_DEPENDENCY(VirtRegMap)
-INITIALIZE_PASS_DEPENDENCY(LiveRegMatrix)
-INITIALIZE_PASS_DEPENDENCY(EdgeBundles)
-INITIALIZE_PASS_DEPENDENCY(SpillPlacement)
+INITIALIZE_PASS_DEPENDENCY(LiveStacksWrapperLegacy)
+INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(VirtRegMapWrapperLegacy)
+INITIALIZE_PASS_DEPENDENCY(LiveRegMatrixWrapperLegacy)
+INITIALIZE_PASS_DEPENDENCY(EdgeBundlesWrapperLegacy)
+INITIALIZE_PASS_DEPENDENCY(SpillPlacementWrapperLegacy)
 INITIALIZE_PASS_DEPENDENCY(MachineOptimizationRemarkEmitterPass)
 INITIALIZE_PASS_DEPENDENCY(RegAllocEvictionAdvisorAnalysis)
 INITIALIZE_PASS_DEPENDENCY(RegAllocPriorityAdvisorAnalysis)
@@ -193,37 +189,35 @@ FunctionPass* llvm::createGreedyRegisterAllocator() {
   return new RAGreedy();
 }
 
-FunctionPass *llvm::createGreedyRegisterAllocator(RegClassFilterFunc Ftor) {
+FunctionPass *llvm::createGreedyRegisterAllocator(RegAllocFilterFunc Ftor) {
   return new RAGreedy(Ftor);
 }
 
-RAGreedy::RAGreedy(RegClassFilterFunc F):
-  MachineFunctionPass(ID),
-  RegAllocBase(F) {
-}
+RAGreedy::RAGreedy(RegAllocFilterFunc F)
+    : MachineFunctionPass(ID), RegAllocBase(F) {}
 
 void RAGreedy::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesCFG();
-  AU.addRequired<MachineBlockFrequencyInfo>();
-  AU.addPreserved<MachineBlockFrequencyInfo>();
-  AU.addRequired<LiveIntervals>();
-  AU.addPreserved<LiveIntervals>();
-  AU.addRequired<SlotIndexes>();
-  AU.addPreserved<SlotIndexes>();
-  AU.addRequired<LiveDebugVariables>();
-  AU.addPreserved<LiveDebugVariables>();
-  AU.addRequired<LiveStacks>();
-  AU.addPreserved<LiveStacks>();
-  AU.addRequired<MachineDominatorTree>();
-  AU.addPreserved<MachineDominatorTree>();
-  AU.addRequired<MachineLoopInfo>();
-  AU.addPreserved<MachineLoopInfo>();
-  AU.addRequired<VirtRegMap>();
-  AU.addPreserved<VirtRegMap>();
-  AU.addRequired<LiveRegMatrix>();
-  AU.addPreserved<LiveRegMatrix>();
-  AU.addRequired<EdgeBundles>();
-  AU.addRequired<SpillPlacement>();
+  AU.addRequired<MachineBlockFrequencyInfoWrapperPass>();
+  AU.addPreserved<MachineBlockFrequencyInfoWrapperPass>();
+  AU.addRequired<LiveIntervalsWrapperPass>();
+  AU.addPreserved<LiveIntervalsWrapperPass>();
+  AU.addRequired<SlotIndexesWrapperPass>();
+  AU.addPreserved<SlotIndexesWrapperPass>();
+  AU.addRequired<LiveDebugVariablesWrapperLegacy>();
+  AU.addPreserved<LiveDebugVariablesWrapperLegacy>();
+  AU.addRequired<LiveStacksWrapperLegacy>();
+  AU.addPreserved<LiveStacksWrapperLegacy>();
+  AU.addRequired<MachineDominatorTreeWrapperPass>();
+  AU.addPreserved<MachineDominatorTreeWrapperPass>();
+  AU.addRequired<MachineLoopInfoWrapperPass>();
+  AU.addPreserved<MachineLoopInfoWrapperPass>();
+  AU.addRequired<VirtRegMapWrapperLegacy>();
+  AU.addPreserved<VirtRegMapWrapperLegacy>();
+  AU.addRequired<LiveRegMatrixWrapperLegacy>();
+  AU.addPreserved<LiveRegMatrixWrapperLegacy>();
+  AU.addRequired<EdgeBundlesWrapperLegacy>();
+  AU.addRequired<SpillPlacementWrapperLegacy>();
   AU.addRequired<MachineOptimizationRemarkEmitterPass>();
   AU.addRequired<RegAllocEvictionAdvisorAnalysis>();
   AU.addRequired<RegAllocPriorityAdvisorAnalysis>();
@@ -380,6 +374,12 @@ unsigned DefaultPriorityAdvisor::getPriority(const LiveInterval &LI) const {
   }
 
   return Prio;
+}
+
+unsigned DummyPriorityAdvisor::getPriority(const LiveInterval &LI) const {
+  // Prioritize by virtual register number, lowest first.
+  Register Reg = LI.reg();
+  return ~Reg.virtRegIndex();
 }
 
 const LiveInterval *RAGreedy::dequeue() { return dequeue(Queue); }
@@ -768,10 +768,28 @@ bool RAGreedy::growRegion(GlobalSplitCandidate &Cand) {
     if (Cand.PhysReg) {
       if (!addThroughConstraints(Cand.Intf, NewBlocks))
         return false;
-    } else
-      // Provide a strong negative bias on through blocks to prevent unwanted
-      // liveness on loop backedges.
-      SpillPlacer->addPrefSpill(NewBlocks, /* Strong= */ true);
+    } else {
+      // Providing that the variable being spilled does not look like a loop
+      // induction variable, which is expensive to spill around and better
+      // pushed into a condition inside the loop if possible, provide a strong
+      // negative bias on through blocks to prevent unwanted liveness on loop
+      // backedges.
+      bool PrefSpill = true;
+      if (SA->looksLikeLoopIV() && NewBlocks.size() >= 2) {
+        // Check that the current bundle is adding a Header + start+end of
+        // loop-internal blocks. If the block is indeed a header, don't make
+        // the NewBlocks as PrefSpill to allow the variable to be live in
+        // Header<->Latch.
+        MachineLoop *L = Loops->getLoopFor(MF->getBlockNumbered(NewBlocks[0]));
+        if (L && L->getHeader()->getNumber() == (int)NewBlocks[0] &&
+            all_of(NewBlocks.drop_front(), [&](unsigned Block) {
+              return L == Loops->getLoopFor(MF->getBlockNumbered(Block));
+            }))
+          PrefSpill = false;
+      }
+      if (PrefSpill)
+        SpillPlacer->addPrefSpill(NewBlocks, /* Strong= */ true);
+    }
     AddedTo = ActiveBlocks.size();
 
     // Perhaps iterating can enable more bundles?
@@ -1039,7 +1057,7 @@ void RAGreedy::splitAroundRegion(LiveRangeEdit &LREdit,
   }
 
   if (VerifyEnabled)
-    MF->verify(this, "After splitting live range around region");
+    MF->verify(this, "After splitting live range around region", &errs());
 }
 
 MCRegister RAGreedy::tryRegionSplit(const LiveInterval &VirtReg,
@@ -1308,7 +1326,7 @@ unsigned RAGreedy::tryBlockSplit(const LiveInterval &VirtReg,
   }
 
   if (VerifyEnabled)
-    MF->verify(this, "After splitting live range around basic blocks");
+    MF->verify(this, "After splitting live range around basic blocks", &errs());
   return 0;
 }
 
@@ -1647,8 +1665,8 @@ unsigned RAGreedy::tryLocalSplit(const LiveInterval &VirtReg,
 
     // Remove any gaps with regmask clobbers.
     if (Matrix->checkRegMaskInterference(VirtReg, PhysReg))
-      for (unsigned I = 0, E = RegMaskGaps.size(); I != E; ++I)
-        GapWeight[RegMaskGaps[I]] = huge_valf;
+      for (unsigned Gap : RegMaskGaps)
+        GapWeight[Gap] = huge_valf;
 
     // Try to find the best sequence of gaps to close.
     // The new spill weight must be larger than any gap interference.
@@ -2017,6 +2035,9 @@ unsigned RAGreedy::tryLastChanceRecoloring(const LiveInterval &VirtReg,
     // available colors.
     Matrix->assign(VirtReg, PhysReg);
 
+    // VirtReg may be deleted during tryRecoloringCandidates, save a copy.
+    Register ThisVirtReg = VirtReg.reg();
+
     // Save the current recoloring state.
     // If we cannot recolor all the interferences, we will have to start again
     // at this point for the next physical register.
@@ -2028,8 +2049,16 @@ unsigned RAGreedy::tryLastChanceRecoloring(const LiveInterval &VirtReg,
         NewVRegs.push_back(NewVReg);
       // Do not mess up with the global assignment process.
       // I.e., VirtReg must be unassigned.
-      Matrix->unassign(VirtReg);
-      return PhysReg;
+      if (VRM->hasPhys(ThisVirtReg)) {
+        Matrix->unassign(VirtReg);
+        return PhysReg;
+      }
+
+      // It is possible VirtReg will be deleted during tryRecoloringCandidates.
+      LLVM_DEBUG(dbgs() << "tryRecoloringCandidates deleted a fixed register "
+                        << printReg(ThisVirtReg) << '\n');
+      FixedRegisters.erase(ThisVirtReg);
+      return 0;
     }
 
     LLVM_DEBUG(dbgs() << "Fail to assign: " << VirtReg << " to "
@@ -2289,9 +2318,9 @@ void RAGreedy::tryHintRecoloring(const LiveInterval &VirtReg) {
     if (Reg.isPhysical())
       continue;
 
-    // This may be a skipped class
+    // This may be a skipped register.
     if (!VRM->hasPhys(Reg)) {
-      assert(!ShouldAllocateClass(*TRI, *MRI->getRegClass(Reg)) &&
+      assert(!shouldAllocateRegister(Reg) &&
              "We have an unallocated variable which should have been handled");
       continue;
     }
@@ -2415,7 +2444,7 @@ MCRegister RAGreedy::selectOrSplitImpl(const LiveInterval &VirtReg,
     } else
       return PhysReg;
   }
-  // Non emtpy NewVRegs means VirtReg has been split.
+  // Non empty NewVRegs means VirtReg has been split.
   if (!NewVRegs.empty())
     return 0;
 
@@ -2453,7 +2482,7 @@ MCRegister RAGreedy::selectOrSplitImpl(const LiveInterval &VirtReg,
     return 0;
   }
 
-  if (Stage < RS_Spill) {
+  if (Stage < RS_Spill && !VirtReg.empty()) {
     // Try splitting VirtReg or interferences.
     unsigned NewVRegSizeBefore = NewVRegs.size();
     Register PhysReg = trySplit(VirtReg, Order, NewVRegs, FixedRegisters);
@@ -2489,10 +2518,13 @@ MCRegister RAGreedy::selectOrSplitImpl(const LiveInterval &VirtReg,
     // Tell LiveDebugVariables about the new ranges. Ranges not being covered by
     // the new regs are kept in LDV (still mapping to the old register), until
     // we rewrite spilled locations in LDV at a later stage.
-    DebugVars->splitRegister(VirtReg.reg(), LRE.regs(), *LIS);
+    for (Register r : spiller().getSpilledRegs())
+      DebugVars->splitRegister(r, LRE.regs(), *LIS);
+    for (Register r : spiller().getReplacedRegs())
+      DebugVars->splitRegister(r, LRE.regs(), *LIS);
 
     if (VerifyEnabled)
-      MF->verify(this, "After spilling");
+      MF->verify(this, "After spilling", &errs());
   }
 
   // The live virtual register requesting allocation was spilled, so tell
@@ -2681,7 +2713,7 @@ bool RAGreedy::hasVirtRegAlloc() {
     const TargetRegisterClass *RC = MRI->getRegClass(Reg);
     if (!RC)
       continue;
-    if (ShouldAllocateClass(*TRI, *RC))
+    if (shouldAllocateRegister(Reg))
       return true;
   }
 
@@ -2696,28 +2728,29 @@ bool RAGreedy::runOnMachineFunction(MachineFunction &mf) {
   TII = MF->getSubtarget().getInstrInfo();
 
   if (VerifyEnabled)
-    MF->verify(this, "Before greedy register allocator");
+    MF->verify(this, "Before greedy register allocator", &errs());
 
-  RegAllocBase::init(getAnalysis<VirtRegMap>(),
-                     getAnalysis<LiveIntervals>(),
-                     getAnalysis<LiveRegMatrix>());
+  RegAllocBase::init(getAnalysis<VirtRegMapWrapperLegacy>().getVRM(),
+                     getAnalysis<LiveIntervalsWrapperPass>().getLIS(),
+                     getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
 
   // Early return if there is no virtual register to be allocated to a
   // physical register.
   if (!hasVirtRegAlloc())
     return false;
 
-  Indexes = &getAnalysis<SlotIndexes>();
+  Indexes = &getAnalysis<SlotIndexesWrapperPass>().getSI();
   // Renumber to get accurate and consistent results from
   // SlotIndexes::getApproxInstrDistance.
   Indexes->packIndexes();
-  MBFI = &getAnalysis<MachineBlockFrequencyInfo>();
-  DomTree = &getAnalysis<MachineDominatorTree>();
+  MBFI = &getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
+  DomTree = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   ORE = &getAnalysis<MachineOptimizationRemarkEmitterPass>().getORE();
-  Loops = &getAnalysis<MachineLoopInfo>();
-  Bundles = &getAnalysis<EdgeBundles>();
-  SpillPlacer = &getAnalysis<SpillPlacement>();
-  DebugVars = &getAnalysis<LiveDebugVariables>();
+  Loops = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
+  Bundles = &getAnalysis<EdgeBundlesWrapperLegacy>().getEdgeBundles();
+  SpillPlacer = &getAnalysis<SpillPlacementWrapperLegacy>().getResult();
+  DebugVars = &getAnalysis<LiveDebugVariablesWrapperLegacy>().getLDV();
+  auto &LSS = getAnalysis<LiveStacksWrapperLegacy>().getLS();
 
   initializeCSRCost();
 
@@ -2738,7 +2771,8 @@ bool RAGreedy::runOnMachineFunction(MachineFunction &mf) {
       getAnalysis<RegAllocPriorityAdvisorAnalysis>().getAdvisor(*MF, *this);
 
   VRAI = std::make_unique<VirtRegAuxInfo>(*MF, *LIS, *VRM, *Loops, *MBFI);
-  SpillerInstance.reset(createInlineSpiller(*this, *MF, *VRM, *VRAI));
+  SpillerInstance.reset(
+      createInlineSpiller({*LIS, LSS, *DomTree, *MBFI}, *MF, *VRM, *VRAI));
 
   VRAI->calculateSpillWeightsAndHints();
 
@@ -2755,7 +2789,7 @@ bool RAGreedy::runOnMachineFunction(MachineFunction &mf) {
   tryHintsRecoloring();
 
   if (VerifyEnabled)
-    MF->verify(this, "Before post optimization");
+    MF->verify(this, "Before post optimization", &errs());
   postOptimization();
   reportStats();
 

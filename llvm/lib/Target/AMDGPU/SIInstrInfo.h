@@ -36,10 +36,16 @@ class RegScavenger;
 class TargetRegisterClass;
 class ScheduleHazardRecognizer;
 
+constexpr unsigned DefaultMemoryClusterDWordsLimit = 8;
+
 /// Mark the MMO of a uniform load if there are no potentially clobbering stores
 /// on any path from the start of an entry function to this load.
 static const MachineMemOperand::Flags MONoClobber =
     MachineMemOperand::MOTargetFlag1;
+
+/// Mark the MMO of a load as the last use.
+static const MachineMemOperand::Flags MOLastUse =
+    MachineMemOperand::MOTargetFlag2;
 
 /// Utility to store machine instructions worklist.
 struct SIInstrWorklist {
@@ -48,12 +54,12 @@ struct SIInstrWorklist {
   void insert(MachineInstr *MI);
 
   MachineInstr *top() const {
-    auto iter = InstrList.begin();
+    const auto *iter = InstrList.begin();
     return *iter;
   }
 
   void erase_top() {
-    auto iter = InstrList.begin();
+    const auto *iter = InstrList.begin();
     InstrList.erase(iter);
   }
 
@@ -102,16 +108,15 @@ private:
 public:
   unsigned buildExtractSubReg(MachineBasicBlock::iterator MI,
                               MachineRegisterInfo &MRI,
-                              MachineOperand &SuperReg,
+                              const MachineOperand &SuperReg,
                               const TargetRegisterClass *SuperRC,
                               unsigned SubIdx,
                               const TargetRegisterClass *SubRC) const;
-  MachineOperand buildExtractSubRegOrImm(MachineBasicBlock::iterator MI,
-                                         MachineRegisterInfo &MRI,
-                                         MachineOperand &SuperReg,
-                                         const TargetRegisterClass *SuperRC,
-                                         unsigned SubIdx,
-                                         const TargetRegisterClass *SubRC) const;
+  MachineOperand buildExtractSubRegOrImm(
+      MachineBasicBlock::iterator MI, MachineRegisterInfo &MRI,
+      const MachineOperand &SuperReg, const TargetRegisterClass *SuperRC,
+      unsigned SubIdx, const TargetRegisterClass *SubRC) const;
+
 private:
   void swapOperands(MachineInstr &Inst) const;
 
@@ -135,12 +140,15 @@ private:
   void splitScalar64BitUnaryOp(SIInstrWorklist &Worklist, MachineInstr &Inst,
                                unsigned Opcode, bool Swap = false) const;
 
-  void splitScalar64BitAddSub(SIInstrWorklist &Worklist, MachineInstr &Inst,
-                              MachineDominatorTree *MDT = nullptr) const;
-
   void splitScalar64BitBinaryOp(SIInstrWorklist &Worklist, MachineInstr &Inst,
                                 unsigned Opcode,
                                 MachineDominatorTree *MDT = nullptr) const;
+
+  void splitScalarSMulU64(SIInstrWorklist &Worklist, MachineInstr &Inst,
+                          MachineDominatorTree *MDT) const;
+
+  void splitScalarSMulPseudo(SIInstrWorklist &Worklist, MachineInstr &Inst,
+                             MachineDominatorTree *MDT) const;
 
   void splitScalar64BitXnor(SIInstrWorklist &Worklist, MachineInstr &Inst,
                             MachineDominatorTree *MDT = nullptr) const;
@@ -148,6 +156,9 @@ private:
   void splitScalar64BitBCNT(SIInstrWorklist &Worklist,
                             MachineInstr &Inst) const;
   void splitScalar64BitBFE(SIInstrWorklist &Worklist, MachineInstr &Inst) const;
+  void splitScalar64BitCountOp(SIInstrWorklist &Worklist, MachineInstr &Inst,
+                               unsigned Opcode,
+                               MachineDominatorTree *MDT = nullptr) const;
   void movePackToVALU(SIInstrWorklist &Worklist, MachineRegisterInfo &MRI,
                       MachineInstr &Inst) const;
 
@@ -168,6 +179,9 @@ private:
                                     const MachineInstr &MIb) const;
 
   Register findUsedSGPR(const MachineInstr &MI, int OpIndices[3]) const;
+
+  bool verifyCopy(const MachineInstr &MI, const MachineRegisterInfo &MRI,
+                  StringRef &ErrInfo) const;
 
 protected:
   /// If the specific machine instruction is a instruction that moves/copies
@@ -228,22 +242,28 @@ public:
   bool areLoadsFromSameBasePtr(SDNode *Load0, SDNode *Load1, int64_t &Offset0,
                                int64_t &Offset1) const override;
 
+  bool isGlobalMemoryObject(const MachineInstr *MI) const override;
+
   bool getMemOperandsWithOffsetWidth(
       const MachineInstr &LdSt,
       SmallVectorImpl<const MachineOperand *> &BaseOps, int64_t &Offset,
-      bool &OffsetIsScalable, unsigned &Width,
+      bool &OffsetIsScalable, LocationSize &Width,
       const TargetRegisterInfo *TRI) const final;
 
   bool shouldClusterMemOps(ArrayRef<const MachineOperand *> BaseOps1,
+                           int64_t Offset1, bool OffsetIsScalable1,
                            ArrayRef<const MachineOperand *> BaseOps2,
-                           unsigned NumLoads, unsigned NumBytes) const override;
+                           int64_t Offset2, bool OffsetIsScalable2,
+                           unsigned ClusterSize,
+                           unsigned NumBytes) const override;
 
   bool shouldScheduleLoadsNear(SDNode *Load0, SDNode *Load1, int64_t Offset0,
                                int64_t Offset1, unsigned NumLoads) const override;
 
   void copyPhysReg(MachineBasicBlock &MBB, MachineBasicBlock::iterator MI,
                    const DebugLoc &DL, MCRegister DestReg, MCRegister SrcReg,
-                   bool KillSrc) const override;
+                   bool KillSrc, bool RenamableDest = false,
+                   bool RenamableSrc = false) const override;
 
   void materializeImmediate(MachineBasicBlock &MBB,
                             MachineBasicBlock::iterator MI, const DebugLoc &DL,
@@ -274,6 +294,11 @@ public:
                             Register VReg) const override;
 
   bool expandPostRAPseudo(MachineInstr &MI) const override;
+
+  void reMaterialize(MachineBasicBlock &MBB, MachineBasicBlock::iterator MI,
+                     Register DestReg, unsigned SubIdx,
+                     const MachineInstr &Orig,
+                     const TargetRegisterInfo &TRI) const override;
 
   // Splits a V_MOV_B64_DPP_PSEUDO opcode into a pair of v_mov_b32_dpp
   // instructions. Returns a pair of generated instructions.
@@ -376,7 +401,7 @@ public:
 
   void removeModOperands(MachineInstr &MI) const;
 
-  bool FoldImmediate(MachineInstr &UseMI, MachineInstr &DefMI, Register Reg,
+  bool foldImmediate(MachineInstr &UseMI, MachineInstr &DefMI, Register Reg,
                      MachineRegisterInfo *MRI) const final;
 
   unsigned getMachineCSELookAheadLimit() const override { return 500; }
@@ -404,12 +429,20 @@ public:
     return get(Opcode).TSFlags & SIInstrFlags::VALU;
   }
 
+  static bool isImage(const MachineInstr &MI) {
+    return isMIMG(MI) || isVSAMPLE(MI) || isVIMAGE(MI);
+  }
+
+  bool isImage(uint16_t Opcode) const {
+    return isMIMG(Opcode) || isVSAMPLE(Opcode) || isVIMAGE(Opcode);
+  }
+
   static bool isVMEM(const MachineInstr &MI) {
-    return isMUBUF(MI) || isMTBUF(MI) || isMIMG(MI);
+    return isMUBUF(MI) || isMTBUF(MI) || isImage(MI);
   }
 
   bool isVMEM(uint16_t Opcode) const {
-    return isMUBUF(Opcode) || isMTBUF(Opcode) || isMIMG(Opcode);
+    return isMUBUF(Opcode) || isMTBUF(Opcode) || isImage(Opcode);
   }
 
   static bool isSOP1(const MachineInstr &MI) {
@@ -534,6 +567,14 @@ public:
     return get(Opcode).TSFlags & SIInstrFlags::DS;
   }
 
+  static bool isLDSDMA(const MachineInstr &MI) {
+    return isVALU(MI) && (isMUBUF(MI) || isFLAT(MI));
+  }
+
+  bool isLDSDMA(uint16_t Opcode) {
+    return isVALU(Opcode) && (isMUBUF(Opcode) || isFLAT(Opcode));
+  }
+
   static bool isGWS(const MachineInstr &MI) {
     return MI.getDesc().TSFlags & SIInstrFlags::GWS;
   }
@@ -550,6 +591,22 @@ public:
 
   bool isMIMG(uint16_t Opcode) const {
     return get(Opcode).TSFlags & SIInstrFlags::MIMG;
+  }
+
+  static bool isVIMAGE(const MachineInstr &MI) {
+    return MI.getDesc().TSFlags & SIInstrFlags::VIMAGE;
+  }
+
+  bool isVIMAGE(uint16_t Opcode) const {
+    return get(Opcode).TSFlags & SIInstrFlags::VIMAGE;
+  }
+
+  static bool isVSAMPLE(const MachineInstr &MI) {
+    return MI.getDesc().TSFlags & SIInstrFlags::VSAMPLE;
+  }
+
+  bool isVSAMPLE(uint16_t Opcode) const {
+    return get(Opcode).TSFlags & SIInstrFlags::VSAMPLE;
   }
 
   static bool isGather4(const MachineInstr &MI) {
@@ -639,6 +696,10 @@ public:
                                   SIInstrFlags::IsAtomicNoRet);
   }
 
+  static bool mayWriteLDSThroughDMA(const MachineInstr &MI) {
+    return isLDSDMA(MI) && MI.getOpcode() != AMDGPU::BUFFER_STORE_LDS_DWORD;
+  }
+
   static bool isWQM(const MachineInstr &MI) {
     return MI.getDesc().TSFlags & SIInstrFlags::WQM;
   }
@@ -655,20 +716,41 @@ public:
     return get(Opcode).TSFlags & SIInstrFlags::DisableWQM;
   }
 
+  // SI_SPILL_S32_TO_VGPR and SI_RESTORE_S32_FROM_VGPR form a special case of
+  // SGPRs spilling to VGPRs which are SGPR spills but from VALU instructions
+  // therefore we need an explicit check for them since just checking if the
+  // Spill bit is set and what instruction type it came from misclassifies
+  // them.
   static bool isVGPRSpill(const MachineInstr &MI) {
-    return MI.getDesc().TSFlags & SIInstrFlags::VGPRSpill;
+    return MI.getOpcode() != AMDGPU::SI_SPILL_S32_TO_VGPR &&
+           MI.getOpcode() != AMDGPU::SI_RESTORE_S32_FROM_VGPR &&
+           (isSpill(MI) && isVALU(MI));
   }
 
   bool isVGPRSpill(uint16_t Opcode) const {
-    return get(Opcode).TSFlags & SIInstrFlags::VGPRSpill;
+    return Opcode != AMDGPU::SI_SPILL_S32_TO_VGPR &&
+           Opcode != AMDGPU::SI_RESTORE_S32_FROM_VGPR &&
+           (isSpill(Opcode) && isVALU(Opcode));
   }
 
   static bool isSGPRSpill(const MachineInstr &MI) {
-    return MI.getDesc().TSFlags & SIInstrFlags::SGPRSpill;
+    return MI.getOpcode() == AMDGPU::SI_SPILL_S32_TO_VGPR ||
+           MI.getOpcode() == AMDGPU::SI_RESTORE_S32_FROM_VGPR ||
+           (isSpill(MI) && isSALU(MI));
   }
 
   bool isSGPRSpill(uint16_t Opcode) const {
-    return get(Opcode).TSFlags & SIInstrFlags::SGPRSpill;
+    return Opcode == AMDGPU::SI_SPILL_S32_TO_VGPR ||
+           Opcode == AMDGPU::SI_RESTORE_S32_FROM_VGPR ||
+           (isSpill(Opcode) && isSALU(Opcode));
+  }
+
+  bool isSpill(uint16_t Opcode) const {
+    return get(Opcode).TSFlags & SIInstrFlags::Spill;
+  }
+
+  static bool isSpill(const MachineInstr &MI) {
+    return MI.getDesc().TSFlags & SIInstrFlags::Spill;
   }
 
   static bool isWWMRegSpillOpcode(uint16_t Opcode) {
@@ -676,6 +758,11 @@ public:
            Opcode == AMDGPU::SI_SPILL_WWM_AV32_SAVE ||
            Opcode == AMDGPU::SI_SPILL_WWM_V32_RESTORE ||
            Opcode == AMDGPU::SI_SPILL_WWM_AV32_RESTORE;
+  }
+
+  static bool isChainCallOpcode(uint64_t Opcode) {
+    return Opcode == AMDGPU::SI_CS_CHAIN_TC_W32 ||
+           Opcode == AMDGPU::SI_CS_CHAIN_TC_W64;
   }
 
   static bool isDPP(const MachineInstr &MI) {
@@ -736,7 +823,15 @@ public:
   }
 
   static bool isMFMAorWMMA(const MachineInstr &MI) {
-    return isMFMA(MI) || isWMMA(MI);
+    return isMFMA(MI) || isWMMA(MI) || isSWMMAC(MI);
+  }
+
+  static bool isSWMMAC(const MachineInstr &MI) {
+    return MI.getDesc().TSFlags & SIInstrFlags::IsSWMMAC;
+  }
+
+  bool isSWMMAC(uint16_t Opcode) const {
+    return get(Opcode).TSFlags & SIInstrFlags::IsSWMMAC;
   }
 
   bool isDOT(uint16_t Opcode) const {
@@ -771,12 +866,13 @@ public:
     return MI.getDesc().TSFlags & SIInstrFlags::LGKM_CNT;
   }
 
-  static bool sopkIsZext(const MachineInstr &MI) {
-    return MI.getDesc().TSFlags & SIInstrFlags::SOPK_ZEXT;
-  }
-
-  bool sopkIsZext(uint16_t Opcode) const {
-    return get(Opcode).TSFlags & SIInstrFlags::SOPK_ZEXT;
+  // Most sopk treat the immediate as a signed 16-bit, however some
+  // use it as unsigned.
+  static bool sopkIsZext(unsigned Opcode) {
+    return Opcode == AMDGPU::S_CMPK_EQ_U32 || Opcode == AMDGPU::S_CMPK_LG_U32 ||
+           Opcode == AMDGPU::S_CMPK_GT_U32 || Opcode == AMDGPU::S_CMPK_GE_U32 ||
+           Opcode == AMDGPU::S_CMPK_LT_U32 || Opcode == AMDGPU::S_CMPK_LE_U32 ||
+           Opcode == AMDGPU::S_GETREG_B32;
   }
 
   /// \returns true if this is an s_store_dword* instruction. This is more
@@ -837,12 +933,94 @@ public:
     return MI.getDesc().TSFlags & SIInstrFlags::IsNeverUniform;
   }
 
+  // Check to see if opcode is for a barrier start. Pre gfx12 this is just the
+  // S_BARRIER, but after support for S_BARRIER_SIGNAL* / S_BARRIER_WAIT we want
+  // to check for the barrier start (S_BARRIER_SIGNAL*)
+  bool isBarrierStart(unsigned Opcode) const {
+    return Opcode == AMDGPU::S_BARRIER ||
+           Opcode == AMDGPU::S_BARRIER_SIGNAL_M0 ||
+           Opcode == AMDGPU::S_BARRIER_SIGNAL_ISFIRST_M0 ||
+           Opcode == AMDGPU::S_BARRIER_SIGNAL_IMM ||
+           Opcode == AMDGPU::S_BARRIER_SIGNAL_ISFIRST_IMM;
+  }
+
+  bool isBarrier(unsigned Opcode) const {
+    return isBarrierStart(Opcode) || Opcode == AMDGPU::S_BARRIER_WAIT ||
+           Opcode == AMDGPU::S_BARRIER_INIT_M0 ||
+           Opcode == AMDGPU::S_BARRIER_INIT_IMM ||
+           Opcode == AMDGPU::S_BARRIER_JOIN_IMM ||
+           Opcode == AMDGPU::S_BARRIER_LEAVE ||
+           Opcode == AMDGPU::S_BARRIER_LEAVE_IMM ||
+           Opcode == AMDGPU::DS_GWS_INIT || Opcode == AMDGPU::DS_GWS_BARRIER;
+  }
+
+  static bool isF16PseudoScalarTrans(unsigned Opcode) {
+    return Opcode == AMDGPU::V_S_EXP_F16_e64 ||
+           Opcode == AMDGPU::V_S_LOG_F16_e64 ||
+           Opcode == AMDGPU::V_S_RCP_F16_e64 ||
+           Opcode == AMDGPU::V_S_RSQ_F16_e64 ||
+           Opcode == AMDGPU::V_S_SQRT_F16_e64;
+  }
+
   static bool doesNotReadTiedSource(const MachineInstr &MI) {
     return MI.getDesc().TSFlags & SIInstrFlags::TiedSourceNotRead;
   }
 
   bool doesNotReadTiedSource(uint16_t Opcode) const {
     return get(Opcode).TSFlags & SIInstrFlags::TiedSourceNotRead;
+  }
+
+  bool isIGLP(unsigned Opcode) const {
+    return Opcode == AMDGPU::SCHED_BARRIER ||
+           Opcode == AMDGPU::SCHED_GROUP_BARRIER || Opcode == AMDGPU::IGLP_OPT;
+  }
+
+  bool isIGLP(const MachineInstr &MI) const { return isIGLP(MI.getOpcode()); }
+
+  static unsigned getNonSoftWaitcntOpcode(unsigned Opcode) {
+    switch (Opcode) {
+    case AMDGPU::S_WAITCNT_soft:
+      return AMDGPU::S_WAITCNT;
+    case AMDGPU::S_WAITCNT_VSCNT_soft:
+      return AMDGPU::S_WAITCNT_VSCNT;
+    case AMDGPU::S_WAIT_LOADCNT_soft:
+      return AMDGPU::S_WAIT_LOADCNT;
+    case AMDGPU::S_WAIT_STORECNT_soft:
+      return AMDGPU::S_WAIT_STORECNT;
+    case AMDGPU::S_WAIT_SAMPLECNT_soft:
+      return AMDGPU::S_WAIT_SAMPLECNT;
+    case AMDGPU::S_WAIT_BVHCNT_soft:
+      return AMDGPU::S_WAIT_BVHCNT;
+    case AMDGPU::S_WAIT_DSCNT_soft:
+      return AMDGPU::S_WAIT_DSCNT;
+    case AMDGPU::S_WAIT_KMCNT_soft:
+      return AMDGPU::S_WAIT_KMCNT;
+    default:
+      return Opcode;
+    }
+  }
+
+  bool isWaitcnt(unsigned Opcode) const {
+    switch (getNonSoftWaitcntOpcode(Opcode)) {
+    case AMDGPU::S_WAITCNT:
+    case AMDGPU::S_WAITCNT_VSCNT:
+    case AMDGPU::S_WAITCNT_VMCNT:
+    case AMDGPU::S_WAITCNT_EXPCNT:
+    case AMDGPU::S_WAITCNT_LGKMCNT:
+    case AMDGPU::S_WAIT_LOADCNT:
+    case AMDGPU::S_WAIT_LOADCNT_DSCNT:
+    case AMDGPU::S_WAIT_STORECNT:
+    case AMDGPU::S_WAIT_STORECNT_DSCNT:
+    case AMDGPU::S_WAIT_SAMPLECNT:
+    case AMDGPU::S_WAIT_BVHCNT:
+    case AMDGPU::S_WAIT_EXPCNT:
+    case AMDGPU::S_WAIT_DSCNT:
+    case AMDGPU::S_WAIT_KMCNT:
+    case AMDGPU::S_WAIT_IDLE:
+      return true;
+    default:
+      return false;
+    }
   }
 
   bool isVGPRCopy(const MachineInstr &MI) const {
@@ -864,7 +1042,13 @@ public:
   /// Return true if the instruction modifies the mode register.q
   static bool modifiesModeRegister(const MachineInstr &MI);
 
-  /// Whether we must prevent this instruction from executing with EXEC = 0.
+  /// This function is used to determine if an instruction can be safely
+  /// executed under EXEC = 0 without hardware error, indeterminate results,
+  /// and/or visible effects on future vector execution or outside the shader.
+  /// Note: as of 2024 the only use of this is SIPreEmitPeephole where it is
+  /// used in removing branches over short EXEC = 0 sequences.
+  /// As such it embeds certain assumptions which may not apply to every case
+  /// of EXEC = 0 execution.
   bool hasUnwantedEffectsWhenEXECEmpty(const MachineInstr &MI) const;
 
   /// Returns true if the instruction could potentially depend on the value of
@@ -873,9 +1057,7 @@ public:
 
   bool isInlineConstant(const APInt &Imm) const;
 
-  bool isInlineConstant(const APFloat &Imm) const {
-    return isInlineConstant(Imm.bitcastToAPInt());
-  }
+  bool isInlineConstant(const APFloat &Imm) const;
 
   // Returns true if this non-register operand definitely does not need to be
   // encoded as a 32-bit literal. Note that this function handles all kinds of
@@ -943,6 +1125,12 @@ public:
   bool usesConstantBus(const MachineRegisterInfo &MRI,
                        const MachineOperand &MO,
                        const MCOperandInfo &OpInfo) const;
+
+  bool usesConstantBus(const MachineRegisterInfo &MRI, const MachineInstr &MI,
+                       int OpIdx) const {
+    return usesConstantBus(MRI, MI.getOperand(OpIdx),
+                           MI.getDesc().operands()[OpIdx]);
+  }
 
   /// Return true if this instruction has any modifiers.
   ///  e.g. src[012]_mod, omod, clamp.
@@ -1042,12 +1230,14 @@ public:
   /// Fix operands in \p MI to satisfy constant bus requirements.
   void legalizeOperandsVOP3(MachineRegisterInfo &MRI, MachineInstr &MI) const;
 
-  /// Copy a value from a VGPR (\p SrcReg) to SGPR.  This function can only
-  /// be used when it is know that the value in SrcReg is same across all
-  /// threads in the wave.
+  /// Copy a value from a VGPR (\p SrcReg) to SGPR. The desired register class
+  /// for the dst register (\p DstRC) can be optionally supplied. This function
+  /// can only be used when it is know that the value in SrcReg is same across
+  /// all threads in the wave.
   /// \returns The SGPR register that \p SrcReg was copied to.
   Register readlaneVGPRToSGPR(Register SrcReg, MachineInstr &UseMI,
-                              MachineRegisterInfo &MRI) const;
+                              MachineRegisterInfo &MRI,
+                              const TargetRegisterClass *DstRC = nullptr) const;
 
   void legalizeOperandsSMRD(MachineRegisterInfo &MRI, MachineInstr &MI) const;
   void legalizeOperandsFLAT(MachineRegisterInfo &MRI, MachineInstr &MI) const;
@@ -1085,6 +1275,15 @@ public:
                    unsigned Quantity) const override;
 
   void insertReturn(MachineBasicBlock &MBB) const;
+
+  /// Build instructions that simulate the behavior of a `s_trap 2` instructions
+  /// for hardware (namely, gfx11) that runs in PRIV=1 mode. There, s_trap is
+  /// interpreted as a nop.
+  MachineBasicBlock *insertSimulatedTrap(MachineRegisterInfo &MRI,
+                                         MachineBasicBlock &MBB,
+                                         MachineInstr &MI,
+                                         const DebugLoc &DL) const;
+
   /// Return the number of wait states that result from executing this
   /// instruction.
   static unsigned getNumWaitStates(const MachineInstr &MI);
@@ -1121,23 +1320,15 @@ public:
   unsigned isStackAccess(const MachineInstr &MI, int &FrameIndex) const;
   unsigned isSGPRStackAccess(const MachineInstr &MI, int &FrameIndex) const;
 
-  unsigned isLoadFromStackSlot(const MachineInstr &MI,
+  Register isLoadFromStackSlot(const MachineInstr &MI,
                                int &FrameIndex) const override;
-  unsigned isStoreToStackSlot(const MachineInstr &MI,
+  Register isStoreToStackSlot(const MachineInstr &MI,
                               int &FrameIndex) const override;
 
   unsigned getInstBundleSize(const MachineInstr &MI) const;
   unsigned getInstSizeInBytes(const MachineInstr &MI) const override;
 
   bool mayAccessFlatAddressSpace(const MachineInstr &MI) const;
-
-  bool isNonUniformBranchInstr(MachineInstr &Instr) const;
-
-  void convertNonUniformIfRegion(MachineBasicBlock *IfEntry,
-                                 MachineBasicBlock *IfEnd) const;
-
-  void convertNonUniformLoopRegion(MachineBasicBlock *LoopEntry,
-                                   MachineBasicBlock *LoopEnd) const;
 
   std::pair<unsigned, unsigned>
   decomposeMachineOperandsTargetFlags(unsigned TF) const override;
@@ -1165,7 +1356,8 @@ public:
   unsigned getLiveRangeSplitOpcode(Register Reg,
                                    const MachineFunction &MF) const override;
 
-  bool isBasicBlockPrologue(const MachineInstr &MI) const override;
+  bool isBasicBlockPrologue(const MachineInstr &MI,
+                            Register Reg = Register()) const override;
 
   MachineInstr *createPHIDestinationCopy(MachineBasicBlock &MBB,
                                          MachineBasicBlock::iterator InsPt,
@@ -1198,11 +1390,9 @@ public:
   static bool isKillTerminator(unsigned Opcode);
   const MCInstrDesc &getKillTerminatorFromPseudo(unsigned Opcode) const;
 
-  static bool isLegalMUBUFImmOffset(unsigned Imm) {
-    return isUInt<12>(Imm);
-  }
+  bool isLegalMUBUFImmOffset(unsigned Imm) const;
 
-  static unsigned getMaxMUBUFImmOffset();
+  static unsigned getMaxMUBUFImmOffset(const GCNSubtarget &ST);
 
   bool splitMUBUFOffset(uint32_t Imm, uint32_t &SOffset, uint32_t &ImmOffset,
                         Align Alignment = Align(4)) const;
@@ -1218,6 +1408,9 @@ public:
   std::pair<int64_t, int64_t> splitFlatOffset(int64_t COffsetVal,
                                               unsigned AddrSpace,
                                               uint64_t FlatVariant) const;
+
+  /// Returns true if negative offsets are allowed for the given \p FlatVariant.
+  bool allowNegativeFlatOffset(uint64_t FlatVariant) const;
 
   /// \brief Return a target-specific opcode if Opcode is a pseudo instruction.
   /// Return -1 if the target-specific opcode for the pseudo instruction does
@@ -1253,7 +1446,7 @@ public:
   getGenericInstructionUniformity(const MachineInstr &MI) const;
 
   const MIRFormatter *getMIRFormatter() const override {
-    if (!Formatter.get())
+    if (!Formatter)
       Formatter = std::make_unique<AMDGPUMIRFormatter>();
     return Formatter.get();
   }
@@ -1347,9 +1540,6 @@ namespace AMDGPU {
   int getIfAddr64Inst(uint16_t Opcode);
 
   LLVM_READONLY
-  int getAtomicNoRetOp(uint16_t Opcode);
-
-  LLVM_READONLY
   int getSOPKOp(uint16_t Opcode);
 
   /// \returns SADDR form of a FLAT Global instruction given an \p Opcode
@@ -1388,6 +1578,11 @@ namespace AMDGPU {
   /// \returns earlyclobber version of a MAC MFMA is exists.
   LLVM_READONLY
   int getMFMAEarlyClobberOp(uint16_t Opcode);
+
+  /// \returns Version of an MFMA instruction which uses AGPRs for srcC and
+  /// vdst, given an \p Opcode of an MFMA which uses VGPRs for srcC/vdst.
+  LLVM_READONLY
+  int getMFMASrcCVDstAGPROp(uint16_t Opcode);
 
   /// \returns v_cmpx version of a v_cmp instruction.
   LLVM_READONLY

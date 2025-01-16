@@ -166,8 +166,7 @@ Error ArgumentCounter::getAllMatchingArgumentsInRemark(
 }
 
 std::optional<std::string> Counter::getGroupByKey(const Remark &Remark) {
-
-  switch (_GroupBy) {
+  switch (Group) {
   case GroupBy::PER_FUNCTION:
     return Remark.FunctionName.str();
   case GroupBy::TOTAL:
@@ -177,10 +176,11 @@ std::optional<std::string> Counter::getGroupByKey(const Remark &Remark) {
     if (!Remark.Loc.has_value())
       return std::nullopt;
 
-    if (_GroupBy == GroupBy::PER_FUNCTION_WITH_DEBUG_LOC)
+    if (Group == GroupBy::PER_FUNCTION_WITH_DEBUG_LOC)
       return Remark.Loc->SourceFilePath.str() + ":" + Remark.FunctionName.str();
     return Remark.Loc->SourceFilePath.str();
   }
+  llvm_unreachable("Fully covered switch above!");
 }
 
 void ArgumentCounter::collect(const Remark &Remark) {
@@ -198,12 +198,8 @@ void ArgumentCounter::collect(const Remark &Remark) {
 }
 
 void RemarkCounter::collect(const Remark &Remark) {
-  std::optional<std::string> Key = getGroupByKey(Remark);
-  if (!Key.has_value())
-    return;
-  auto Iter = CountedByRemarksMap.insert({*Key, 1});
-  if (!Iter.second)
-    Iter.first->second += 1;
+  if (std::optional<std::string> Key = getGroupByKey(Remark))
+    ++CountedByRemarksMap[*Key];
 }
 
 Error ArgumentCounter::print(StringRef OutputFileName) {
@@ -213,7 +209,7 @@ Error ArgumentCounter::print(StringRef OutputFileName) {
     return MaybeOF.takeError();
 
   auto OF = std::move(*MaybeOF);
-  OF->os() << groupByToStr(_GroupBy) << ",";
+  OF->os() << groupByToStr(Group) << ",";
   unsigned Idx = 0;
   for (auto [Key, _] : ArgumentSetIdxMap) {
     OF->os() << Key;
@@ -243,7 +239,7 @@ Error RemarkCounter::print(StringRef OutputFileName) {
     return MaybeOF.takeError();
 
   auto OF = std::move(*MaybeOF);
-  OF->os() << groupByToStr(_GroupBy) << ","
+  OF->os() << groupByToStr(Group) << ","
            << "Count\n";
   for (auto [Key, Count] : CountedByRemarksMap)
     OF->os() << Key << "," << Count << "\n";

@@ -15,7 +15,6 @@
 #include "llvm/ExecutionEngine/JITLink/TableManager.h"
 #include "llvm/ExecutionEngine/JITLink/ppc64.h"
 #include "llvm/Object/ELFObjectFile.h"
-#include "llvm/Support/Endian.h"
 
 #include "EHFrameSupportImpl.h"
 #include "ELFLinkGraphBuilder.h"
@@ -43,17 +42,22 @@ public:
 
   bool visitEdge(LinkGraph &G, Block *B, Edge &E) {
     Edge::Kind K = E.getKind();
-    if (K == ppc64::RequestTLSDescInGOTAndTransformToTOCDelta16HA) {
+    switch (K) {
+    case ppc64::RequestTLSDescInGOTAndTransformToTOCDelta16HA:
       E.setKind(ppc64::TOCDelta16HA);
       E.setTarget(this->getEntryForTarget(G, E.getTarget()));
       return true;
-    }
-    if (K == ppc64::RequestTLSDescInGOTAndTransformToTOCDelta16LO) {
+    case ppc64::RequestTLSDescInGOTAndTransformToTOCDelta16LO:
       E.setKind(ppc64::TOCDelta16LO);
       E.setTarget(this->getEntryForTarget(G, E.getTarget()));
       return true;
+    case ppc64::RequestTLSDescInGOTAndTransformToDelta34:
+      E.setKind(ppc64::Delta34);
+      E.setTarget(this->getEntryForTarget(G, E.getTarget()));
+      return true;
+    default:
+      return false;
     }
-    return false;
   }
 
   Symbol &createEntry(LinkGraph &G, Symbol &Target) {
@@ -102,14 +106,14 @@ Symbol &createELFGOTHeader(LinkGraph &G,
   Symbol *TOCSymbol = nullptr;
 
   for (Symbol *Sym : G.defined_symbols())
-    if (LLVM_UNLIKELY(Sym->getName() == ELFTOCSymbolName)) {
+    if (LLVM_UNLIKELY(Sym->hasName() && *Sym->getName() == ELFTOCSymbolName)) {
       TOCSymbol = Sym;
       break;
     }
 
   if (LLVM_LIKELY(TOCSymbol == nullptr)) {
     for (Symbol *Sym : G.external_symbols())
-      if (Sym->getName() == ELFTOCSymbolName) {
+      if (Sym->hasName() && *Sym->getName() == ELFTOCSymbolName) {
         TOCSymbol = Sym;
         break;
       }
@@ -234,9 +238,14 @@ private:
     if (ELFReloc == ELF::R_PPC64_TLSLD)
       return make_error<StringError>("Local-dynamic TLS model is not supported",
                                      inconvertibleErrorCode());
+
     if (ELFReloc == ELF::R_PPC64_PCREL_OPT)
       // TODO: Support PCREL optimization, now ignore it.
       return Error::success();
+
+    if (ELFReloc == ELF::R_PPC64_TPREL34)
+      return make_error<StringError>("Local-exec TLS model is not supported",
+                                     inconvertibleErrorCode());
 
     auto ObjSymbol = Base::Obj.getRelocationSymbol(Rel, Base::SymTabSec);
     if (!ObjSymbol)
@@ -372,6 +381,9 @@ private:
     case ELF::R_PPC64_GOT_TLSGD16_LO:
       Kind = ppc64::RequestTLSDescInGOTAndTransformToTOCDelta16LO;
       break;
+    case ELF::R_PPC64_GOT_TLSGD_PCREL34:
+      Kind = ppc64::RequestTLSDescInGOTAndTransformToDelta34;
+      break;
     }
 
     Edge GE(Kind, Offset, *GraphSymbol, Addend);
@@ -381,10 +393,12 @@ private:
 
 public:
   ELFLinkGraphBuilder_ppc64(StringRef FileName,
-                            const object::ELFFile<ELFT> &Obj, Triple TT,
-                            SubtargetFeatures Features)
-      : ELFLinkGraphBuilder<ELFT>(Obj, std::move(TT), std::move(Features),
-                                  FileName, ppc64::getEdgeKindName) {}
+                            const object::ELFFile<ELFT> &Obj,
+                            std::shared_ptr<orc::SymbolStringPool> SSP,
+                            Triple TT, SubtargetFeatures Features)
+      : ELFLinkGraphBuilder<ELFT>(Obj, std::move(SSP), std::move(TT),
+                                  std::move(Features), FileName,
+                                  ppc64::getEdgeKindName) {}
 };
 
 template <llvm::endianness Endianness>
@@ -405,7 +419,8 @@ private:
 
   Error defineTOCBase(LinkGraph &G) {
     for (Symbol *Sym : G.defined_symbols()) {
-      if (LLVM_UNLIKELY(Sym->getName() == ELFTOCSymbolName)) {
+      if (LLVM_UNLIKELY(Sym->hasName() &&
+                        *Sym->getName() == ELFTOCSymbolName)) {
         TOCSymbol = Sym;
         return Error::success();
       }
@@ -415,7 +430,7 @@ private:
            "TOCSymbol should not be defined at this point");
 
     for (Symbol *Sym : G.external_symbols()) {
-      if (Sym->getName() == ELFTOCSymbolName) {
+      if (Sym->hasName() && *Sym->getName() == ELFTOCSymbolName) {
         TOCSymbol = Sym;
         break;
       }
@@ -451,7 +466,8 @@ private:
 
 template <llvm::endianness Endianness>
 Expected<std::unique_ptr<LinkGraph>>
-createLinkGraphFromELFObject_ppc64(MemoryBufferRef ObjectBuffer) {
+createLinkGraphFromELFObject_ppc64(MemoryBufferRef ObjectBuffer,
+                                   std::shared_ptr<orc::SymbolStringPool> SSP) {
   LLVM_DEBUG({
     dbgs() << "Building jitlink graph for new input "
            << ObjectBuffer.getBufferIdentifier() << "...\n";
@@ -468,7 +484,7 @@ createLinkGraphFromELFObject_ppc64(MemoryBufferRef ObjectBuffer) {
   using ELFT = object::ELFType<Endianness, true>;
   auto &ELFObjFile = cast<object::ELFObjectFile<ELFT>>(**ELFObj);
   return ELFLinkGraphBuilder_ppc64<Endianness>(
-             (*ELFObj)->getFileName(), ELFObjFile.getELFFile(),
+             (*ELFObj)->getFileName(), ELFObjFile.getELFFile(), std::move(SSP),
              (*ELFObj)->makeTriple(), std::move(*Features))
       .buildGraph();
 }
@@ -505,15 +521,16 @@ void link_ELF_ppc64(std::unique_ptr<LinkGraph> G,
 }
 
 Expected<std::unique_ptr<LinkGraph>>
-createLinkGraphFromELFObject_ppc64(MemoryBufferRef ObjectBuffer) {
+createLinkGraphFromELFObject_ppc64(MemoryBufferRef ObjectBuffer,
+                                   std::shared_ptr<orc::SymbolStringPool> SSP) {
   return createLinkGraphFromELFObject_ppc64<llvm::endianness::big>(
-      std::move(ObjectBuffer));
+      std::move(ObjectBuffer), std::move(SSP));
 }
 
-Expected<std::unique_ptr<LinkGraph>>
-createLinkGraphFromELFObject_ppc64le(MemoryBufferRef ObjectBuffer) {
+Expected<std::unique_ptr<LinkGraph>> createLinkGraphFromELFObject_ppc64le(
+    MemoryBufferRef ObjectBuffer, std::shared_ptr<orc::SymbolStringPool> SSP) {
   return createLinkGraphFromELFObject_ppc64<llvm::endianness::little>(
-      std::move(ObjectBuffer));
+      std::move(ObjectBuffer), std::move(SSP));
 }
 
 /// jit-link the given object buffer, which must be a ELF ppc64 object file.

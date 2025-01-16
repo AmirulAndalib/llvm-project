@@ -8,6 +8,7 @@
 
 #include "mlir/IR/OperationSupport.h"
 #include "../../test/lib/Dialect/Test/TestDialect.h"
+#include "../../test/lib/Dialect/Test/TestOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/BitVector.h"
@@ -295,9 +296,9 @@ TEST(OperationEquivalenceTest, HashWorksWithFlags) {
   MLIRContext context;
   context.getOrLoadDialect<test::TestDialect>();
 
-  auto op1 = createOp(&context);
+  auto *op1 = createOp(&context);
   // `op1` has an unknown loc.
-  auto op2 = createOp(&context);
+  auto *op2 = createOp(&context);
   op2->setLoc(NameLoc::get(StringAttr::get(&context, "foo")));
   auto getHash = [](Operation *op, OperationEquivalence::Flags flags) {
     return OperationEquivalence::computeHash(
@@ -310,6 +311,23 @@ TEST(OperationEquivalenceTest, HashWorksWithFlags) {
             getHash(op2, OperationEquivalence::None));
   op1->destroy();
   op2->destroy();
+}
+
+TEST(ValueRangeTest, ValueConstructable) {
+  MLIRContext context;
+  Builder builder(&context);
+
+  Operation *useOp =
+      createOp(&context, /*operands=*/std::nullopt, builder.getIntegerType(16));
+  // Valid construction despite a temporary 'OpResult'.
+  ValueRange operands = useOp->getResult(0);
+
+  useOp->setOperands(operands);
+  EXPECT_EQ(useOp->getNumOperands(), 1u);
+  EXPECT_EQ(useOp->getOperand(0), useOp->getResult(0));
+
+  useOp->dropAllUses();
+  useOp->destroy();
 }
 
 } // namespace

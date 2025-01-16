@@ -56,12 +56,10 @@
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/Support/BinaryStreamWriter.h"
 #include "llvm/Support/Casting.h"
-#include "llvm/Support/Endian.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/Program.h"
 #include "llvm/Support/SMLoc.h"
 #include "llvm/Support/ScopedPrinter.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
@@ -71,7 +69,6 @@
 #include <cassert>
 #include <cctype>
 #include <cstddef>
-#include <iterator>
 #include <limits>
 
 using namespace llvm;
@@ -143,7 +140,7 @@ StringRef CodeViewDebug::getFullFilepath(const DIFile *File) {
 
   // If this is a Unix-style path, just use it as is. Don't try to canonicalize
   // it textually because one of the path components could be a symlink.
-  if (Dir.startswith("/") || Filename.startswith("/")) {
+  if (Dir.starts_with("/") || Filename.starts_with("/")) {
     if (llvm::sys::path::is_absolute(Filename, llvm::sys::path::Style::posix))
       return Filename;
     Filepath = std::string(Dir);
@@ -614,7 +611,7 @@ static SourceLanguage MapDWLangToCVLang(unsigned DWLang) {
 void CodeViewDebug::beginModule(Module *M) {
   // If module doesn't have named metadata anchors or COFF debug section
   // is not available, skip any debug info related stuff.
-  if (!MMI->hasDebugInfo() ||
+  if (!Asm->hasDebugInfo() ||
       !Asm->getObjFileLowering().getCOFFDebugSymbolsSection()) {
     Asm = nullptr;
     return;
@@ -637,7 +634,7 @@ void CodeViewDebug::beginModule(Module *M) {
 }
 
 void CodeViewDebug::endModule() {
-  if (!Asm || !MMI->hasDebugInfo())
+  if (!Asm || !Asm->hasDebugInfo())
     return;
 
   // The COFF .debug$S section consists of several subsections, each starting
@@ -894,37 +891,6 @@ static TypeIndex getStringIdTypeIdx(GlobalTypeTableBuilder &TypeTable,
   return TypeTable.writeLeafType(SIR);
 }
 
-static std::string flattenCommandLine(ArrayRef<std::string> Args,
-                                      StringRef MainFilename) {
-  std::string FlatCmdLine;
-  raw_string_ostream OS(FlatCmdLine);
-  bool PrintedOneArg = false;
-  if (!StringRef(Args[0]).contains("-cc1")) {
-    llvm::sys::printArg(OS, "-cc1", /*Quote=*/true);
-    PrintedOneArg = true;
-  }
-  for (unsigned i = 0; i < Args.size(); i++) {
-    StringRef Arg = Args[i];
-    if (Arg.empty())
-      continue;
-    if (Arg == "-main-file-name" || Arg == "-o") {
-      i++; // Skip this argument and next one.
-      continue;
-    }
-    if (Arg.startswith("-object-file-name") || Arg == MainFilename)
-      continue;
-    // Skip fmessage-length for reproduciability.
-    if (Arg.startswith("-fmessage-length"))
-      continue;
-    if (PrintedOneArg)
-      OS << " ";
-    llvm::sys::printArg(OS, Arg, /*Quote=*/true);
-    PrintedOneArg = true;
-  }
-  OS.flush();
-  return FlatCmdLine;
-}
-
 void CodeViewDebug::emitBuildInfo() {
   // First, make LF_BUILDINFO. It's a sequence of strings with various bits of
   // build info. The known prefix is:
@@ -948,13 +914,11 @@ void CodeViewDebug::emitBuildInfo() {
   // FIXME: PDB is intentionally blank unless we implement /Zi type servers.
   BuildInfoArgs[BuildInfoRecord::TypeServerPDB] =
       getStringIdTypeIdx(TypeTable, "");
-  if (Asm->TM.Options.MCOptions.Argv0 != nullptr) {
-    BuildInfoArgs[BuildInfoRecord::BuildTool] =
-        getStringIdTypeIdx(TypeTable, Asm->TM.Options.MCOptions.Argv0);
-    BuildInfoArgs[BuildInfoRecord::CommandLine] = getStringIdTypeIdx(
-        TypeTable, flattenCommandLine(Asm->TM.Options.MCOptions.CommandLineArgs,
-                                      MainSourceFile->getFilename()));
-  }
+  BuildInfoArgs[BuildInfoRecord::BuildTool] =
+      getStringIdTypeIdx(TypeTable, Asm->TM.Options.MCOptions.Argv0);
+  BuildInfoArgs[BuildInfoRecord::CommandLine] = getStringIdTypeIdx(
+      TypeTable, Asm->TM.Options.MCOptions.CommandlineArgs);
+
   BuildInfoRecord BIR(BuildInfoArgs);
   TypeIndex BuildInfoIndex = TypeTable.writeLeafType(BIR);
 
@@ -1397,6 +1361,12 @@ void CodeViewDebug::calculateRanges(
     // We can only handle a register or an offseted load of a register.
     if (Location->Register == 0 || Location->LoadChain.size() > 1)
       continue;
+
+    // Codeview can only express byte-aligned offsets, ensure that we have a
+    // byte-boundaried location.
+    if (Location->FragmentInfo)
+      if (Location->FragmentInfo->OffsetInBits % 8)
+        continue;
 
     LocalVarDef DR;
     DR.CVRegister = TRI->getCodeViewRegNum(Location->Register);
@@ -2070,7 +2040,7 @@ TypeIndex CodeViewDebug::lowerTypeFunction(const DISubroutineType *Ty) {
     ReturnAndArgTypeIndices.back() = TypeIndex::None();
   }
   TypeIndex ReturnTypeIndex = TypeIndex::Void();
-  ArrayRef<TypeIndex> ArgTypeIndices = std::nullopt;
+  ArrayRef<TypeIndex> ArgTypeIndices = {};
   if (!ReturnAndArgTypeIndices.empty()) {
     auto ReturnAndArgTypesRef = ArrayRef(ReturnAndArgTypeIndices);
     ReturnTypeIndex = ReturnAndArgTypesRef.front();
@@ -2584,7 +2554,7 @@ CodeViewDebug::lowerRecordFieldList(const DICompositeType *Ty) {
 
     // Virtual function pointer member.
     if ((Member->getFlags() & DINode::FlagArtificial) &&
-        Member->getName().startswith("_vptr$")) {
+        Member->getName().starts_with("_vptr$")) {
       VFPtrRecord VFPR(getTypeIndex(Member->getBaseType()));
       ContinuationBuilder.writeMemberType(VFPR);
       MemberCount++;
@@ -3434,10 +3404,8 @@ void CodeViewDebug::emitDebugInfoForGlobal(const CVGlobalVariable &CVGV) {
     OS.emitInt32(getCompleteTypeIndex(DIGV->getType()).getIndex());
     OS.AddComment("DataOffset");
 
-    uint64_t Offset = 0;
-    if (CVGlobalVariableOffsets.contains(DIGV))
-      // Use the offset seen while collecting info on globals.
-      Offset = CVGlobalVariableOffsets[DIGV];
+    // Use the offset seen while collecting info on globals.
+    uint64_t Offset = CVGlobalVariableOffsets.lookup(DIGV);
     OS.emitCOFFSecRel32(GVSym, Offset);
 
     OS.AddComment("Segment");

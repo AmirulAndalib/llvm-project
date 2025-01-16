@@ -34,6 +34,11 @@ class PatternRewriter;
 
 namespace tosa {
 
+ParseResult parseTypeOrAttr(OpAsmParser &parser, TypeAttr &typeAttr,
+                            Attribute &attr);
+void printTypeOrAttr(OpAsmPrinter &p, Operation *op, TypeAttr type,
+                     Attribute attr);
+
 #include "mlir/Dialect/Tosa/IR/TosaInterfaces.h.inc"
 
 } // namespace tosa
@@ -55,11 +60,11 @@ public:
     if (llvm::isa<FloatType>(resElemType))
       return impl::verifySameOperandsAndResultElementType(op);
 
-    if (auto resIntType = resElemType.dyn_cast<IntegerType>()) {
+    if (auto resIntType = dyn_cast<IntegerType>(resElemType)) {
       IntegerType lhsIntType =
-          getElementTypeOrSelf(op->getOperand(0)).cast<IntegerType>();
+          cast<IntegerType>(getElementTypeOrSelf(op->getOperand(0)));
       IntegerType rhsIntType =
-          getElementTypeOrSelf(op->getOperand(1)).cast<IntegerType>();
+          cast<IntegerType>(getElementTypeOrSelf(op->getOperand(1)));
       if (lhsIntType != rhsIntType)
         return op->emitOpError(
             "requires the same element type for all operands");
@@ -73,17 +78,66 @@ public:
       return success();
     }
 
-    return failure();
+    // In cases of all other types, op requires the same element
+    // type for all operands and result.
+    return impl::verifySameOperandsAndResultElementType(op);
+  }
+};
+
+/// This class indicates that an op is tosa-elementwise (permits broadcasting,
+/// unlike Elementwise trait).
+template <typename ConcreteType>
+class TosaElementwiseOperator
+    : public TraitBase<ConcreteType, TosaElementwiseOperator> {};
+
+LogicalResult verifyTosaResolvableShapeOperands(Operation *op);
+/// This class verifies that tosa shape operands are compile time resolvable
+template <typename ConcreteType>
+class TosaResolvableShapeOperands
+    : public TraitBase<ConcreteType, TosaResolvableShapeOperands> {
+public:
+  static LogicalResult verifyTrait(Operation *op) {
+    return verifyTosaResolvableShapeOperands(op);
+  }
+};
+
+LogicalResult verifyTosaShapeOperator(Operation *op);
+/// This class indicates that op operates on tosa shape types
+template <typename ConcreteType>
+class TosaShapeOperator : public TraitBase<ConcreteType, TosaShapeOperator> {
+public:
+  static LogicalResult verifyTrait(Operation *op) {
+    return verifyTosaShapeOperator(op);
+  }
+};
+
+LogicalResult verifyTosaShapeOperatorWithSameRanks(Operation *op);
+/// This class indicates that op operates on tosa shape types
+template <typename ConcreteType>
+class TosaShapeOperatorWithSameRanks
+    : public TraitBase<ConcreteType, TosaShapeOperatorWithSameRanks> {
+public:
+  static LogicalResult verifyTrait(Operation *op) {
+    return verifyTosaShapeOperatorWithSameRanks(op);
   }
 };
 
 } // namespace tosa
 } // namespace OpTrait
 
+namespace tosa {
+
+bool isa_tosa_shape_type(mlir::Type t);
+
+} // namespace tosa
+
 } // namespace mlir
 
 #define GET_ATTRDEF_CLASSES
 #include "mlir/Dialect/Tosa/IR/TosaAttributes.h.inc"
+
+#define GET_TYPEDEF_CLASSES
+#include "mlir/Dialect/Tosa/IR/TosaOpsTypesBase.h.inc"
 
 #define GET_OP_CLASSES
 #include "mlir/Dialect/Tosa/IR/TosaOps.h.inc"

@@ -132,7 +132,7 @@ static void recordCondition(CallBase &CB, BasicBlock *From, BasicBlock *To,
   if (!BI || !BI->isConditional())
     return;
 
-  CmpInst::Predicate Pred;
+  CmpPredicate Pred;
   Value *Cond = BI->getCondition();
   if (!match(Cond, m_ICmp(Pred, m_Value(), m_Constant())))
     return;
@@ -142,7 +142,7 @@ static void recordCondition(CallBase &CB, BasicBlock *From, BasicBlock *To,
     if (isCondRelevantToAnyCallArgument(Cmp, CB))
       Conditions.push_back({Cmp, From->getTerminator()->getSuccessor(0) == To
                                      ? Pred
-                                     : Cmp->getInversePredicate()});
+                                     : Cmp->getInverseCmpPredicate()});
 }
 
 /// Record ICmp conditions relevant to any argument in CB following Pred's
@@ -372,10 +372,10 @@ static void splitCallSite(CallBase &CB,
     return;
   }
 
-  auto *OriginalBegin = &*TailBB->begin();
+  BasicBlock::iterator OriginalBegin = TailBB->begin();
   // Replace users of the original call with a PHI mering call-sites split.
   if (CallPN) {
-    CallPN->insertBefore(OriginalBegin);
+    CallPN->insertBefore(*TailBB, OriginalBegin);
     CB.replaceAllUsesWith(CallPN);
   }
 
@@ -387,6 +387,7 @@ static void splitCallSite(CallBase &CB,
   // do not introduce unnecessary PHI nodes for def-use chains from the call
   // instruction to the beginning of the block.
   auto I = CB.getReverseIterator();
+  Instruction *OriginalBeginInst = &*OriginalBegin;
   while (I != TailBB->rend()) {
     Instruction *CurrentI = &*I++;
     if (!CurrentI->use_empty()) {
@@ -399,12 +400,13 @@ static void splitCallSite(CallBase &CB,
       for (auto &Mapping : ValueToValueMaps)
         NewPN->addIncoming(Mapping[CurrentI],
                            cast<Instruction>(Mapping[CurrentI])->getParent());
-      NewPN->insertBefore(&*TailBB->begin());
+      NewPN->insertBefore(*TailBB, TailBB->begin());
       CurrentI->replaceAllUsesWith(NewPN);
     }
+    CurrentI->dropDbgRecords();
     CurrentI->eraseFromParent();
     // We are done once we handled the first original instruction in TailBB.
-    if (CurrentI == OriginalBegin)
+    if (CurrentI == OriginalBeginInst)
       break;
   }
 }

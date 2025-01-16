@@ -6,22 +6,19 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "hdr/math_macros.h"
 #include "src/__support/FPUtil/FPBits.h"
 #include "src/errno/libc_errno.h"
 #include "src/math/asinf.h"
 #include "test/UnitTest/FPMatcher.h"
 #include "test/UnitTest/Test.h"
-#include <math.h>
 
-#include <errno.h>
 #include <stdint.h>
 
-using FPBits = LIBC_NAMESPACE::fputil::FPBits<float>;
+using LlvmLibcAsinfTest = LIBC_NAMESPACE::testing::FPTest<float>;
 
-DECLARE_SPECIAL_CONSTANTS(float)
-
-TEST(LlvmLibcAsinfTest, SpecialNumbers) {
-  libc_errno = 0;
+TEST_F(LlvmLibcAsinfTest, SpecialNumbers) {
+  LIBC_NAMESPACE::libc_errno = 0;
 
   EXPECT_FP_EQ_ALL_ROUNDING(aNaN, LIBC_NAMESPACE::asinf(aNaN));
   EXPECT_MATH_ERRNO(0);
@@ -44,3 +41,27 @@ TEST(LlvmLibcAsinfTest, SpecialNumbers) {
   EXPECT_FP_EQ_ALL_ROUNDING(aNaN, LIBC_NAMESPACE::asinf(-2.0f));
   EXPECT_MATH_ERRNO(EDOM);
 }
+
+#ifdef LIBC_TEST_FTZ_DAZ
+
+using namespace LIBC_NAMESPACE::testing;
+
+TEST_F(LlvmLibcAsinfTest, FTZMode) {
+  ModifyMXCSR mxcsr(FTZ);
+
+  EXPECT_FP_EQ(0.0f, LIBC_NAMESPACE::asinf(min_denormal));
+}
+
+TEST_F(LlvmLibcAsinfTest, DAZMode) {
+  ModifyMXCSR mxcsr(DAZ);
+
+  EXPECT_FP_EQ(0.0f, LIBC_NAMESPACE::asinf(min_denormal));
+}
+
+TEST_F(LlvmLibcAsinfTest, FTZDAZMode) {
+  ModifyMXCSR mxcsr(FTZ | DAZ);
+
+  EXPECT_FP_EQ(0.0f, LIBC_NAMESPACE::asinf(min_denormal));
+}
+
+#endif

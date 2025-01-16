@@ -571,11 +571,11 @@ bool LoongArchExpandAtomicPseudo::expandAtomicCmpXchg(
     BuildMI(LoopTailMBB, DL, TII->get(LoongArch::B)).addMBB(DoneMBB);
   }
 
-  AtomicOrdering Ordering =
+  AtomicOrdering FailureOrdering =
       static_cast<AtomicOrdering>(MI.getOperand(IsMasked ? 6 : 5).getImm());
   int hint;
 
-  switch (Ordering) {
+  switch (FailureOrdering) {
   case AtomicOrdering::Acquire:
   case AtomicOrdering::AcquireRelease:
   case AtomicOrdering::SequentiallyConsistent:
@@ -588,7 +588,9 @@ bool LoongArchExpandAtomicPseudo::expandAtomicCmpXchg(
 
   // .tail:
   //   dbar 0x700 | acquire
-  BuildMI(TailMBB, DL, TII->get(LoongArch::DBAR)).addImm(hint);
+
+  if (!(hint == 0x700 && MF->getSubtarget<LoongArchSubtarget>().hasLD_SEQ_SA()))
+    BuildMI(TailMBB, DL, TII->get(LoongArch::DBAR)).addImm(hint);
 
   NextMBBI = MBB.end();
   MI.eraseFromParent();
