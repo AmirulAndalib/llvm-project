@@ -970,6 +970,7 @@ llvm::gatherPeelingPreferences(Loop *L, ScalarEvolution &SE,
   PP.PeelCount = 0;
   PP.AllowPeeling = true;
   PP.AllowLoopNestsPeeling = false;
+  PP.PeelLast = false;
   PP.PeelProfiledIterations = true;
 
   // Get the target specifc values.
