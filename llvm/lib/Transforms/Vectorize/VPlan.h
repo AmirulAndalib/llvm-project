@@ -1697,7 +1697,10 @@ public:
   bool onlyFirstLaneUsed(const VPValue *Op) const override {
     assert(is_contained(operands(), Op) &&
            "Op must be an operand of the recipe");
-    return Op == getOperand(0) && isPointerLoopInvariant();
+    if (Op == getOperand(0))
+      return isPointerLoopInvariant();
+    else
+      return !isPointerLoopInvariant() && Op->isDefinedOutsideLoopRegions();
   }
 };
 
@@ -1922,6 +1925,11 @@ public:
 
   /// Update the step value of the recipe.
   void setStepValue(VPValue *V) { setOperand(1, V); }
+
+  /// Returns the number of incoming values, also number of incoming blocks.
+  /// Note that at the moment, VPWidenPointerInductionRecipe only has a single
+  /// incoming value, its start value.
+  unsigned getNumIncoming() const override { return 1; }
 
   PHINode *getPHINode() const { return cast<PHINode>(getUnderlyingValue()); }
 
@@ -2798,20 +2806,21 @@ public:
 /// VPReplicateRecipe replicates a given instruction producing multiple scalar
 /// copies of the original scalar type, one per lane, instead of producing a
 /// single copy of widened type for all lanes. If the instruction is known to be
-/// uniform only one copy, per lane zero, will be generated.
+/// a single scalar, only one copy, per lane zero, will be generated.
 class VPReplicateRecipe : public VPRecipeWithIRFlags, public VPIRMetadata {
   /// Indicator if only a single replica per lane is needed.
-  bool IsUniform;
+  bool IsSingleScalar;
 
   /// Indicator if the replicas are also predicated.
   bool IsPredicated;
 
 public:
   VPReplicateRecipe(Instruction *I, ArrayRef<VPValue *> Operands,
-                    bool IsUniform, VPValue *Mask = nullptr,
+                    bool IsSingleScalar, VPValue *Mask = nullptr,
                     VPIRMetadata Metadata = {})
       : VPRecipeWithIRFlags(VPDef::VPReplicateSC, Operands, *I),
-        VPIRMetadata(Metadata), IsUniform(IsUniform), IsPredicated(Mask) {
+        VPIRMetadata(Metadata), IsSingleScalar(IsSingleScalar),
+        IsPredicated(Mask) {
     if (Mask)
       addOperand(Mask);
   }
@@ -2820,7 +2829,7 @@ public:
 
   VPReplicateRecipe *clone() override {
     auto *Copy =
-        new VPReplicateRecipe(getUnderlyingInstr(), operands(), IsUniform,
+        new VPReplicateRecipe(getUnderlyingInstr(), operands(), IsSingleScalar,
                               isPredicated() ? getMask() : nullptr, *this);
     Copy->transferFlags(*this);
     return Copy;
@@ -2843,7 +2852,7 @@ public:
              VPSlotTracker &SlotTracker) const override;
 #endif
 
-  bool isUniform() const { return IsUniform; }
+  bool isSingleScalar() const { return IsSingleScalar; }
 
   bool isPredicated() const { return IsPredicated; }
 
@@ -2851,7 +2860,7 @@ public:
   bool onlyFirstLaneUsed(const VPValue *Op) const override {
     assert(is_contained(operands(), Op) &&
            "Op must be an operand of the recipe");
-    return isUniform();
+    return isSingleScalar();
   }
 
   /// Returns true if the recipe uses scalars of operand \p Op.
@@ -3863,6 +3872,10 @@ public:
   /// Clone all blocks in the single-entry single-exit region of the block and
   /// their recipes without updating the operands of the cloned recipes.
   VPRegionBlock *clone() override;
+
+  /// Remove the current region from its VPlan, connecting its predecessor to
+  /// its entry, and its exiting block to its successor.
+  void dissolveToCFGLoop();
 };
 
 /// VPlan models a candidate for vectorization, encoding various decisions take
